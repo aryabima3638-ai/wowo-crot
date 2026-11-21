@@ -1,0 +1,124 @@
+name: Build Flutter
+run-name: Build ${{ inputs.tag }} (${{ inputs.build_type }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag yang berisi source ZIP
+        required: true
+      build_type:
+        description: release atau debug
+        default: release
+      flutter_version:
+        description: Versi Flutter (kosong = stable terbaru)
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.pub-cache
+          key: gradle-pub-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            gradle-pub-${{ runner.os }}-
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          channel: stable
+          cache: true
+
+      - name: Download & extract source ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p source
+          gh release download "${{ inputs.tag }}" --repo ${{ github.repository }} --pattern "*.zip" --dir source
+          cd source
+          unzip -q -o ./source.zip || unzip -q -o ./*.zip
+          PUB=$(find . -name pubspec.yaml -not -path '*/__MACOSX/*' -not -path '*/.dart_tool/*' -not -path '*/ephemeral/*' -not -path '*/example/*' -not -path '*/.symlinks/*' | awk '{print length, $0}' | sort -n | sed -n '1p' | cut -d' ' -f2- || true)
+          if [ -z "$PUB" ]; then
+            echo "Isi ZIP (3 level teratas):"
+            find . -maxdepth 3 | head -60 || true
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Zip folder project Flutter yang ada pubspec.yaml."
+            exit 1
+          fi
+          ROOT=$(cd "$(dirname "$PUB")" && pwd)
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+
+
+      - name: Auto-fix minSdk (minimal 23)
+        run: |
+          cd "$PROJECT_ROOT"
+          python3 - <<'PY'
+          import re, glob
+          files = glob.glob('android/app/build.gradle') + glob.glob('android/app/build.gradle.kts')
+          rx = re.compile(r'(minSdk(?:Version)?)(\s*=?\s*)(\d+|flutter\.minSdkVersion)')
+          def fix(m):
+              v = m.group(3)
+              if v.isdigit() and int(v) >= 23:
+                  return m.group(0)
+              return m.group(1) + m.group(2) + '23'
+          for f in files:
+              src = open(f, encoding='utf-8').read()
+              out = rx.sub(fix, src)
+              if out != src:
+                  open(f, 'w', encoding='utf-8').write(out)
+                  print('minSdk dinaikkan ke 23 di', f)
+          PY
+
+      - name: Optimasi Gradle
+        run: |
+          AV=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          if [ "${AV:-99}" -lt 8 ]; then sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost; fi
+          mkdir -p ~/.gradle
+          {
+            echo 'org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g'
+            echo 'org.gradle.parallel=true'
+            echo 'org.gradle.caching=true'
+            echo 'org.gradle.configureondemand=true'
+          } >> ~/.gradle/gradle.properties
+
+      - name: Flutter build
+        run: |
+          cd "$PROJECT_ROOT"
+          flutter pub get
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ARGS="--debug --target-platform android-arm64"
+          else
+            ARGS="--release --target-platform android-arm64 --no-shrink"
+          fi
+          set +e
+          flutter build apk $ARGS 2>&1 | tee /tmp/build.log
+          RC=${PIPESTATUS[0]}
+          # Gradle/AGP project lebih rendah dari syarat Flutter -> ulangi sekali dengan bypass validasi bawaan Flutter
+          if [ "$RC" -ne 0 ] && grep -q "lower than Flutter's minimum supported version" /tmp/build.log; then
+            echo "::notice::Validasi versi Gradle/AGP di-bypass, build diulang"
+            flutter build apk $ARGS --android-skip-build-dependency-validation 2>&1 | tee /tmp/build.log
+            RC=${PIPESTATUS[0]}
+          fi
+          exit $RC
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ inputs.build_type }}
+          path: ${{ env.PROJECT_ROOT }}/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
